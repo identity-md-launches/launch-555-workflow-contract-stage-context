@@ -1,0 +1,11 @@
+# Foundry build artifacts
+out/
+cache/
+broadcast/
+
+# Scratch space for local checks; never submitted
+test/scratch/
+
+# Secrets never live in the repository
+.env
+.env.*
