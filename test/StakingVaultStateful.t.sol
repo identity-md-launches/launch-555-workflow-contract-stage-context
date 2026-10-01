@@ -74,11 +74,30 @@ contract VaultCashflowHandler is Test {
         uint256 minimum = vault.minimumFunding();
         if (wallet < minimum) return;
         uint256 amount = bound(amountSeed, minimum, wallet);
+        uint256 rate = vault.rewardRate();
+        bool active = block.timestamp < vault.periodFinish();
+        if (active) {
+            uint256 recyclable = vault.unallocatedRewards();
+            // Funding checkpoints emissions from any idle interval before applying the rate floor.
+            if (vault.totalStaked() == 0) {
+                recyclable += (block.timestamp - vault.lastUpdateTime()) * rate;
+            }
+            uint256 proposed =
+                (amount + recyclable + (vault.periodFinish() - block.timestamp) * rate) / vault.rewardsDuration();
+            if (proposed < rate) {
+                vm.prank(actor);
+                vm.expectRevert(abi.encodeWithSelector(StakingVault.RewardRateDecrease.selector, proposed, rate));
+                vault.fundRewards(amount);
+                assertEq(token.balanceOf(actor), wallet, "rejected funding took tokens");
+                return;
+            }
+        }
         vm.prank(actor);
         vault.fundRewards(amount);
         ledger[actor].funded += amount;
         funded += amount;
         assertEq(token.balanceOf(actor), wallet - amount, "funding cash flow");
+        if (active) assertGe(vault.rewardRate(), rate, "funding slowed the active stream");
     }
 
     function claim(uint256 actorSeed) public monotonicCheckpoint {
@@ -207,6 +226,9 @@ contract VaultCashflowHandler is Test {
     function rejectMissingApproval(uint256 actorSeed, bool funding) external monotonicCheckpoint {
         address actor = actors[actorSeed % 4];
         uint256 amount = funding ? vault.minimumFunding() : 1;
+        // Replacing a whole period's emissions always reaches the token pull, even when an
+        // active stream would reject minimumFunding before checking its allowance.
+        if (funding && vault.rewardForDuration() > amount) amount = vault.rewardForDuration();
         vm.startPrank(actor);
         token.approve(address(vault), 0);
         vm.expectRevert(
@@ -262,6 +284,43 @@ contract StakingVaultStatefulTest is Test {
         selectors[9] = handler.rejectMissingApproval.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
+    }
+
+    function test_handlerRejectsSlowerFundingWithoutRecordingCashFlow() public {
+        uint256 fundedBefore = handler.funded();
+        uint256 finish = vault.periodFinish();
+        uint256 updated = vault.lastUpdateTime();
+        uint256 accumulator = vault.rewardPerTokenStored();
+        uint256 wallet = token.balanceOf(actors[0]);
+        uint256 accrued = vault.earned(actors[0]);
+
+        // The seeded stream emits one token/second; after a day, 1,000 tokens cannot
+        // replace the 86,400 tokens already emitted over a fresh 30-day period.
+        handler.fund(0, vault.minimumFunding());
+
+        assertEq(handler.funded(), fundedBefore);
+        assertEq(vault.periodFinish(), finish);
+        assertEq(vault.lastUpdateTime(), updated);
+        assertEq(vault.rewardPerTokenStored(), accumulator);
+        assertEq(token.balanceOf(actors[0]), wallet);
+        assertEq(vault.earned(actors[0]), accrued);
+        invariant_cashAndPrincipalMatchIndependentLedger();
+        invariant_allRewardLiabilitiesFitInsideReserveTogether();
+    }
+
+    function test_handlerMissingApprovalReachesTokenPullDuringActiveStream() public {
+        handler.rejectMissingApproval(0, true);
+        assertEq(token.allowance(actors[0], address(vault)), type(uint256).max);
+        invariant_cashAndPrincipalMatchIndependentLedger();
+        invariant_allRewardLiabilitiesFitInsideReserveTogether();
+
+        // A rejected call must not prevent a subsequent approved contribution.
+        uint256 fundedBefore = handler.funded();
+        uint256 amount = vault.rewardForDuration();
+        handler.fund(0, amount);
+        assertEq(handler.funded(), fundedBefore + amount);
+        invariant_cashAndPrincipalMatchIndependentLedger();
+        invariant_allRewardLiabilitiesFitInsideReserveTogether();
     }
 
     function invariant_cashAndPrincipalMatchIndependentLedger() public view {
