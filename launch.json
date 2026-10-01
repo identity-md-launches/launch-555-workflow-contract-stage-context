@@ -1,0 +1,26 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "Vault Stake",
+    "symbol": "VSTK",
+    "decimals": 18
+  },
+  "contracts": [
+    {
+      "contract": "StakingVault",
+      "constructorArgs": [
+        "$token",
+        "2592000",
+        "1000000000000000000000"
+      ]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "LaunchToken has no constructor arguments. StakingVault stakes and pays rewards in the launch token. Its constructor fixes a 30-day reward period (2592000 seconds) and a minimum funding amount of 1000 VSTK (1000000000000000000000 minor units), matching the accepted deployment defaults. Anyone may fund rewards; each funding restarts the period and spreads remaining rewards over it. Each stake locks the account's entire principal for 7 days; earned rewards may be claimed during the lock. The vault has no owner or privileged beneficiary and starts empty, with no reward stream until funded. No initialization calls are required. The pool pairs with native ETH; initialPrice is decimal sqrtPriceX96. The factory supplies the LP, MerkleDistributor and initialization-only PoolInitializationGuard. Policy and signed artifact linkage are supplied by services."
+}
