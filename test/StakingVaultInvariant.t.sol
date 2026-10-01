@@ -120,15 +120,52 @@ contract StakingVaultInvariantTest is Test {
         assertEq(vault.totalRewardsFunded(), handler.ghostFunded());
         assertLe(vault.totalRewardsPaid(), vault.totalRewardsFunded());
         uint256 owed;
+        uint256 checkpointed;
         for (uint256 i; i < actors.length; ++i) {
             owed += vault.earned(actors[i]);
+            checkpointed += vault.rewards(actors[i]);
         }
         assertLe(owed, vault.rewardReserve());
+        assertEq(vault.totalCheckpointedRewards(), checkpointed);
+        uint256 remaining = vault.periodFinish() > block.timestamp ? vault.periodFinish() - block.timestamp : 0;
+        assertLe(owed + remaining * vault.rewardRate() + vault.unallocatedRewards(), vault.rewardReserve());
+
+        if (vault.totalStaked() == 0) {
+            // Includes empty-period emissions not yet checkpointed into unallocatedRewards.
+            uint256 uncheckpointedStream = (vault.periodFinish() - vault.lastUpdateTime()) * vault.rewardRate();
+            assertEq(checkpointed + uncheckpointedStream + vault.unallocatedRewards(), vault.rewardReserve());
+        }
     }
 
     /// @dev The active period never promises more than the vault has set aside for it.
     function invariant_periodCoveredByReserve() public view {
         uint256 remaining = vault.periodFinish() > block.timestamp ? vault.periodFinish() - block.timestamp : 0;
         assertLe(remaining * vault.rewardRate() + vault.unallocatedRewards(), vault.rewardReserve());
+    }
+
+    /// @dev Settle every account after each random sequence. No unpaid entitlement may be recycled, and all
+    /// residual funded rewards must become recyclable once the final principal balance is withdrawn.
+    function afterInvariant() public {
+        uint256 now_ = vm.getBlockTimestamp();
+        uint256 end = vault.periodFinish() > now_ ? vault.periodFinish() : now_;
+        vm.warp(end + vault.LOCK_DURATION());
+        for (uint256 i; i < actors.length; ++i) {
+            if (vault.balanceOf(actors[i]) != 0) {
+                vm.prank(actors[i]);
+                vault.exit();
+            } else if (vault.earned(actors[i]) != 0) {
+                vm.prank(actors[i]);
+                vault.claim();
+            }
+        }
+        // If there were no stakers, checkpoint any empty-period emissions as well.
+        token.approve(address(vault), 1);
+        vault.stake(1);
+        vm.warp(vm.getBlockTimestamp() + vault.LOCK_DURATION());
+        vault.exit();
+        assertEq(vault.totalStaked(), 0);
+        assertEq(vault.totalCheckpointedRewards(), 0);
+        assertEq(vault.rewardReserve(), vault.unallocatedRewards());
+        assertEq(token.balanceOf(address(vault)), vault.unallocatedRewards());
     }
 }

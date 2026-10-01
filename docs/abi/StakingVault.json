@@ -307,6 +307,19 @@
   },
   {
     "type": "function",
+    "name": "totalCheckpointedRewards",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "totalRewardsFunded",
     "inputs": [],
     "outputs": [
@@ -524,6 +537,22 @@
     "type": "error",
     "name": "ReentrancyGuardReentrantCall",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "RewardRateDecrease",
+    "inputs": [
+      {
+        "name": "proposed",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "current",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
   },
   {
     "type": "error",

@@ -17,8 +17,8 @@ has no owner parameter, so `$owner` is not used anywhere. Identifier suggestion 
 | Parameter | Recommended | Meaning |
 | --- | --- | --- |
 | `token_` | `$token` | the launch token; the vault stakes it and pays rewards in it |
-| `rewardsDuration_` | `2592000` (30 days) | every funding (re)starts a period of this many seconds |
-| `minimumFunding_` | `1000000000000000000000` (1,000 tokens) | smallest accepted funding, guards against dust fundings stretching the period |
+| `rewardsDuration_` | `2592000` (30 days) | every accepted funding (re)starts a period of this many seconds |
+| `minimumFunding_` | `1000000000000000000000` (1,000 tokens) | absolute funding floor; the active-period rate check can require a larger contribution |
 
 `LOCK_DURATION` is a compile-time constant of 7 days, as the brief requires, and is not a parameter.
 
@@ -30,25 +30,50 @@ one millionth of the supply; raise it if dust fundings turn out to be a nuisance
 if small community top-ups are wanted. Both must be fixed before the manifest is written and cannot be
 changed afterwards.
 
+### Active-period pacing
+
+A funding that restarts an active period must produce a rate at least as high as the current rate.
+Otherwise `fundRewards` reverts with `RewardRateDecrease(proposed, current)` and changes nothing.
+This check applies to every funder, including the original funder. There is no authorization role.
+At or after `periodFinish`, a new funding can start a lower-rate period.
+
+At a proposed inclusion timestamp during an active period, let `remaining = periodFinish - timestamp`
+and let `parked` include `unallocatedRewards` plus any emissions since `lastUpdateTime` while the vault
+was empty. The contribution must be positive, at least `minimumFunding`, and satisfy:
+
+```
+amount + parked + remaining * rewardRate >= rewardsDuration * rewardRate
+```
+
+When the right-hand side exceeds the existing parked and unstreamed balance, that difference is the
+additional minimum required to restart. For example, with a 1,000,000-token, 30-day stream and stakers
+present throughout, a 1,000-token top-up at day one is rejected. Funders can contribute more or wait for
+the period to end. Simulate the call near submission and handle reverts as time and other activity change
+the required amount. The constructor values and argument order are unchanged by this pacing revision.
+
 ## Constructor behaviour under the factory
 
 - The constructor is nonpayable, takes only `address`/`uint256` arguments, makes no external calls and
   reads nothing from `msg.sender`. The factory's address plays no role; there is no owner.
 - The vault starts empty: `totalStaked = 0`, `rewardRate = 0`, `periodFinish = 0`. It receives no share of
   the supply. The factory keeps the whole supply for the policy split (`SupplyMismatch` otherwise).
-- Runtime is about 7.9 KB, well under EIP-170, with no `DELEGATECALL`, `CALLCODE` or `SELFDESTRUCT`.
+- Vault runtime is 4,212 bytes with the pinned settings, well under EIP-170, with no `DELEGATECALL`,
+  `CALLCODE` or `SELFDESTRUCT`.
 
 ## After deployment (operational responsibilities)
 
 | Who | What |
 | --- | --- |
-| Anyone who wants stakers paid | `approve(vault, amount)` then `fundRewards(amount)` with at least `minimumFunding`. The vault pays nothing until it is funded. The requester's wallet, which receives the non-pool part of the supply from the policy split, is the natural first funder. |
+| Anyone who wants stakers paid | Simulate `fundRewards(amount)`, then `approve(vault, amount)` and fund with at least `minimumFunding` and enough to preserve an active rate. Handle `RewardRateDecrease` by increasing the contribution or waiting for the period to end. The vault pays nothing until funded. The requester's wallet, which receives the non-pool part of the supply from the policy split, is the natural first funder. |
 | Whoever runs the website | Read `aprWad`, `totalStaked`, `balanceOf`, `earned`, `lockedUntil`, `periodFinish` from `docs/abi/StakingVault.json`; wire `approve` + `stake`, `unstake`, `claim`, `exit`. Show the unlock time before a top-up, because a top-up re-locks the whole balance. |
 | Stakers | Approve, stake, wait 7 days to unstake; claim any time. |
 | Nobody | There is no admin. No parameter can be changed, nothing can be paused, no token can be recovered from the vault. |
 
 When a period ends and nobody funds again, rewards stop; whatever streamed while nobody was staked waits
 in `unallocatedRewards` and is handed out by the next funding of at least `minimumFunding`.
+Accumulator and account rounding dust joins that balance when the last stake is withdrawn. Unclaimed
+account rewards stay reserved across later periods; operators cannot sweep them or dust. Recycling
+requires future funding and staking activity, with a nonzero resulting rate.
 
 ## Local or manual deployment with the script
 

@@ -26,23 +26,35 @@ everything and claims in one call.
 **Rewards.** `fundRewards(amount)` is open to anyone (prior `approve` required). The amount, plus whatever
 the active period had not yet streamed, plus any `unallocatedRewards`, is spread evenly over a new period
 of `rewardsDuration` seconds starting now, so a top-up never takes back rewards that were already earned.
+While a period is active, a top-up must preserve or increase `rewardRate`; otherwise it reverts with
+`RewardRateDecrease(proposed, current)` without taking tokens or changing the stream. This pacing decision
+retains the full-duration restart for accepted fundings while preventing a funder from pushing existing
+emissions past another staker's departure by lowering the rate. Anyone may fund enough to meet this rule,
+or wait until the current period ends to start a smaller stream.
 Rewards accrue per second to stakers in proportion to their stake (Synthetix `rewardPerToken`
 accounting, 1e18 scale). `claim()` pays everything earned so far at any time; rewards are never locked,
 only principal is. Nothing accrues before the first funding or after the period ends until someone funds
 again.
 
-**Nothing is stranded.** Rewards that stream while nobody is staked, and the rounding remainder of
+**Recycling undistributed rewards.** Rewards that stream while nobody is staked, and the rounding remainder of
 `total / rewardsDuration`, are parked in `unallocatedRewards` and folded into the next funding instead of
-being lost, as they are in the plain Synthetix contract.
+being lost. Accumulator and account checkpoint rounding also leaves dust in the reserve. When the last
+stake is withdrawn, all accounts have checkpointed: the vault reserves their unpaid rewards and the
+remaining active stream, then assigns the residual funded balance to `unallocatedRewards`. This dust can
+join later funding without consuming principal or anyone's unclaimed reward. Dust reconciliation requires
+the vault to become empty; distribution requires another accepted funding and stakers. Individual
+fractional entitlements are rounded down, with settled dust pooled for future stakers.
 
 **Principal is untouchable.** Stake and reward balances are tracked separately. Rewards paid are bounded
 by rewards funded (`rewardRate * rewardsDuration <= total`), the only outgoing transfers are a caller's own
 `balanceOf` and a caller's own checkpointed `rewards`, and `rewardReserve()` (funded minus paid) always
 equals the vault balance minus `totalStaked`. The invariant suite checks this under random sequences.
 
-**Minimum funding.** Every funding stretches the leftover of the active period over a fresh period, so a
-stream of 1-wei fundings could slow stakers' payouts (never reduce them). `minimumFunding` makes that cost
-real tokens that go to the stakers themselves. It may be set to zero.
+**Minimum funding.** `minimumFunding` is an absolute contribution floor and may be zero. It is not an
+economic defense against slowing payouts: the separate rate check enforces pacing even with a zero
+minimum. During an active period, an amount must cover both this floor and any additional funding needed
+to keep the rate unchanged over a fresh full duration. Funders should simulate their transaction near
+submission because this additional requirement grows as the active period elapses.
 
 ### Views for the website
 
@@ -55,6 +67,7 @@ real tokens that go to the stakers themselves. It may be set to zero.
 | `aprWad()` | `rewardRate * 365 days * 1e18 / totalStaked`; 1e18 = 100 % APR; 0 when nothing is staked or no period is active |
 | `rewardRate()`, `periodFinish()`, `rewardForDuration()` | the active stream |
 | `rewardReserve()`, `unallocatedRewards()` | rewards still in the vault, and the parked part |
+| `totalCheckpointedRewards()` | sum of unpaid account checkpoints; excludes rewards accruing since each account's last checkpoint |
 
 ### What the vault does not do
 

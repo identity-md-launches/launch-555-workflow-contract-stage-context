@@ -10,12 +10,14 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 /// rewards that anyone can fund, streamed per second pro rata to stake.
 ///
 /// @dev Accounting follows the Synthetix StakingRewards model (a global `rewardPerToken` accumulator scaled by
-/// 1e18) with two additions that keep every funded token reachable:
+/// 1e18) with additions that allow undistributed funded rewards to be recycled:
 ///
 /// - Rewards that stream while nothing is staked are not lost: they accumulate in `unallocatedRewards` and are
 ///   folded into the next funding.
 /// - The rounding remainder of `total / rewardsDuration` is likewise kept in `unallocatedRewards` instead of
 ///   being stranded.
+/// - Accumulator and account rounding dust is reconciled into `unallocatedRewards` when the last stake leaves,
+///   after reserving all unpaid checkpointed rewards and the unstreamed part of the active period.
 ///
 /// Principal is untouchable by construction: stake and reward balances are tracked separately, rewards paid
 /// are bounded above by rewards funded (`rewardRate * rewardsDuration <= total`), and nothing in the contract
@@ -39,11 +41,11 @@ contract StakingVault is ReentrancyGuard {
     /// @notice The token that is staked and the token rewards are paid in. The launch token.
     IERC20 public immutable token;
 
-    /// @notice Length, in seconds, of the reward period that every funding (re)starts.
+    /// @notice Length, in seconds, of the reward period that every accepted funding (re)starts.
     uint256 public immutable rewardsDuration;
 
-    /// @notice Smallest amount `fundRewards` accepts, in minor units. Stops dust fundings from repeatedly
-    /// stretching the active period (each funding spreads the leftover over a fresh `rewardsDuration`).
+    /// @notice Absolute funding floor in minor units. Active-period funding must also preserve or increase
+    /// the emission rate; meeting this floor alone does not guarantee acceptance.
     uint256 public immutable minimumFunding;
 
     // ------------------------------------------------------------------------------------------------------
@@ -65,8 +67,8 @@ contract StakingVault is ReentrancyGuard {
     /// @notice Cumulative rewards per staked token, scaled by 1e18.
     uint256 public rewardPerTokenStored;
 
-    /// @notice Rewards that streamed while nothing was staked, plus funding rounding remainders. Folded into the
-    /// next funding so they are never stranded.
+    /// @notice Rewards streamed without stake, funding remainders and dust reconciled on the last withdrawal.
+    /// Folded into the next accepted funding.
     uint256 public unallocatedRewards;
 
     /// @notice Lifetime total of rewards funded through `fundRewards`.
@@ -74,6 +76,9 @@ contract StakingVault is ReentrancyGuard {
 
     /// @notice Lifetime total of rewards paid out through `claim` and `exit`.
     uint256 public totalRewardsPaid;
+
+    /// @notice Sum of unpaid `rewards` checkpoints. Excludes accrual not yet checkpointed for each account.
+    uint256 public totalCheckpointedRewards;
 
     // ------------------------------------------------------------------------------------------------------
     // Per-account state
@@ -107,6 +112,7 @@ contract StakingVault is ReentrancyGuard {
     error InsufficientStake(uint256 requested, uint256 available);
     error FundingBelowMinimum(uint256 amount, uint256 minimum);
     error RewardRateZero();
+    error RewardRateDecrease(uint256 proposed, uint256 current);
     error NothingToClaim();
     error TransferAmountMismatch(uint256 expected, uint256 received);
 
@@ -169,7 +175,8 @@ contract StakingVault is ReentrancyGuard {
 
     /// @notice Add `amount` tokens of rewards. Anyone may call. Requires a prior approval. The amount, whatever
     /// is still unstreamed from the active period and any unallocated remainder are spread evenly over a new
-    /// period of `rewardsDuration` seconds starting now.
+    /// period of `rewardsDuration` seconds starting now. During an active period, reverts if this would lower
+    /// the emission rate. Smaller contributions can wait until the current period finishes.
     function fundRewards(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
         if (amount < minimumFunding) revert FundingBelowMinimum(amount, minimumFunding);
@@ -181,6 +188,7 @@ contract StakingVault is ReentrancyGuard {
         }
         uint256 rate = total / rewardsDuration;
         if (rate == 0) revert RewardRateZero();
+        if (block.timestamp < periodFinish && rate < rewardRate) revert RewardRateDecrease(rate, rewardRate);
 
         rewardRate = rate;
         unallocatedRewards = total % rewardsDuration;
@@ -219,7 +227,7 @@ contract StakingVault is ReentrancyGuard {
     }
 
     /// @notice Rewards still inside the vault: funded minus paid. Includes the unstreamed part of the active
-    /// period, checkpointed-but-unclaimed rewards and `unallocatedRewards`.
+    /// period, accrued-but-unclaimed rewards, unreconciled rounding dust and `unallocatedRewards`.
     function rewardReserve() public view returns (uint256) {
         return totalRewardsFunded - totalRewardsPaid;
     }
@@ -247,7 +255,9 @@ contract StakingVault is ReentrancyGuard {
         }
         lastUpdateTime = applicable;
         if (account != address(0)) {
-            rewards[account] = earned(account);
+            uint256 checkpoint = earned(account);
+            totalCheckpointedRewards += checkpoint - rewards[account];
+            rewards[account] = checkpoint;
             userRewardPerTokenPaid[account] = rewardPerTokenStored;
         }
     }
@@ -262,6 +272,12 @@ contract StakingVault is ReentrancyGuard {
 
         balanceOf[msg.sender] = staked - amount;
         totalStaked -= amount;
+        if (totalStaked == 0) {
+            // Every former staker has now checkpointed. Only amounts outside their unpaid rewards and the
+            // remaining stream can be recycled. Use funded-minus-paid accounting, never the token balance.
+            uint256 unstreamed = (periodFinish - lastUpdateTime) * rewardRate;
+            unallocatedRewards = rewardReserve() - totalCheckpointedRewards - unstreamed;
+        }
         emit Unstaked(msg.sender, amount);
 
         token.safeTransfer(msg.sender, amount);
@@ -272,6 +288,7 @@ contract StakingVault is ReentrancyGuard {
         reward = rewards[msg.sender];
         if (reward == 0) return 0;
         rewards[msg.sender] = 0;
+        totalCheckpointedRewards -= reward;
         totalRewardsPaid += reward;
         emit RewardPaid(msg.sender, reward);
         token.safeTransfer(msg.sender, reward);

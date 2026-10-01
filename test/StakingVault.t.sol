@@ -356,6 +356,100 @@ contract StakingVaultTest is Test {
         assertEq(vault.unallocatedRewards(), total - (total / DURATION) * DURATION);
     }
 
+    function test_topUpCannotLowerRateAndRevertRollsBackCheckpoint() public {
+        _stake(alice, 100e18);
+        _fund(1_000_000e18);
+        uint256 finish = vault.periodFinish();
+        uint256 rate = vault.rewardRate();
+        uint256 updated = vault.lastUpdateTime();
+        uint256 accumulator = vault.rewardPerTokenStored();
+        uint256 parked = vault.unallocatedRewards();
+        uint256 funderBalance = token.balanceOf(funder);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        uint256 earnedBefore = vault.earned(alice);
+        uint256 proposed = (MIN_FUNDING + parked + (finish - block.timestamp) * rate) / DURATION;
+
+        vm.prank(funder);
+        vm.expectRevert(abi.encodeWithSelector(StakingVault.RewardRateDecrease.selector, proposed, rate));
+        vault.fundRewards(MIN_FUNDING);
+
+        assertEq(vault.rewardRate(), rate);
+        assertEq(vault.periodFinish(), finish);
+        assertEq(vault.lastUpdateTime(), updated);
+        assertEq(vault.rewardPerTokenStored(), accumulator);
+        assertEq(vault.unallocatedRewards(), parked);
+        assertEq(vault.earned(alice), earnedBefore);
+        assertEq(vault.totalRewardsFunded(), 1_000_000e18);
+        assertEq(token.balanceOf(funder), funderBalance);
+        _assertSolvent();
+    }
+
+    function test_topUpAtRateFloorAcceptedOneWeiLessRejected() public {
+        _stake(alice, 100e18);
+        _fund(DURATION * 1e18);
+        uint256 finish = vault.periodFinish();
+        vm.warp(vm.getBlockTimestamp() + 10 days);
+        uint256 topUp = 10 days * 1e18;
+        uint256 earnedBefore = vault.earned(alice);
+
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(StakingVault.RewardRateDecrease.selector, 1e18 - 1, 1e18));
+        vault.fundRewards(topUp - 1);
+        vm.prank(bob);
+        vault.fundRewards(topUp);
+        assertEq(vault.rewardRate(), 1e18);
+        assertEq(vault.periodFinish(), block.timestamp + DURATION);
+        assertEq(vault.earned(alice), earnedBefore);
+
+        vm.warp(finish);
+        assertEq(vault.earned(alice), DURATION * 1e18, "original scheduled rewards were delayed");
+        _assertSolvent();
+    }
+
+    function test_lowerRateCanStartAtExactPeriodFinish() public {
+        _stake(alice, 100e18);
+        _fund(DURATION * 1e18);
+        uint256 finish = vault.periodFinish();
+        vm.warp(finish - 1);
+        uint256 proposed = (MIN_FUNDING + 1e18) / DURATION;
+        vm.prank(funder);
+        vm.expectRevert(abi.encodeWithSelector(StakingVault.RewardRateDecrease.selector, proposed, 1e18));
+        vault.fundRewards(MIN_FUNDING);
+
+        vm.warp(finish);
+        _fund(MIN_FUNDING);
+        assertEq(vault.rewardRate(), MIN_FUNDING / DURATION);
+        assertEq(vault.earned(alice), DURATION * 1e18);
+        assertEq(vault.periodFinish(), finish + DURATION);
+        _assertSolvent();
+    }
+
+    function testFuzz_activeFundingCannotLowerRate(uint256 delay, uint256 amount) public {
+        delay = bound(delay, 1, DURATION - 1);
+        amount = bound(amount, MIN_FUNDING, 5_000_000e18);
+        _stake(alice, 100e18);
+        _fund(DURATION * 1e18);
+        uint256 finish = vault.periodFinish();
+        vm.warp(vm.getBlockTimestamp() + delay);
+        uint256 earnedBefore = vault.earned(alice);
+        uint256 proposed = (amount + (DURATION - delay) * 1e18) / DURATION;
+        if (proposed < 1e18) {
+            vm.prank(funder);
+            vm.expectRevert(abi.encodeWithSelector(StakingVault.RewardRateDecrease.selector, proposed, 1e18));
+            vault.fundRewards(amount);
+            assertEq(vault.periodFinish(), finish);
+        } else {
+            _fund(amount);
+            assertGe(vault.rewardRate(), 1e18);
+            assertEq(vault.periodFinish(), block.timestamp + DURATION);
+        }
+        assertEq(vault.earned(alice), earnedBefore);
+        vm.warp(finish);
+        // Each of the two global updates loses less than totalStaked / 1e18 = 100 token wei.
+        assertGe(vault.earned(alice) + 200, DURATION * 1e18);
+        _assertSolvent();
+    }
+
     function test_rewardsStreamedWithNoStakersAreParkedNotLost() public {
         _fund(3_000e18);
         uint256 rate = vault.rewardRate();
@@ -547,6 +641,118 @@ contract StakingVaultTest is Test {
         assertEq(token.balanceOf(alice), 1_000_000e18);
     }
 
+    function test_settledDustIsRecycledAndPaidByLaterFunding() public {
+        _stake(alice, 7e18);
+        _fund(DURATION * (1e18 + 1));
+        vm.warp(vault.periodFinish());
+        vm.prank(alice);
+        vault.exit();
+        assertEq(vault.totalStaked(), 0);
+        assertEq(vault.earned(alice), 0);
+        assertEq(vault.totalCheckpointedRewards(), 0);
+        assertEq(vault.rewardReserve(), 3);
+        assertEq(vault.unallocatedRewards(), 3, "settled rounding dust must be recyclable");
+        _assertSolvent();
+
+        // Donations must not enter the reconciliation; only accounted reward funds may be recycled.
+        token.transfer(address(vault), 10e18);
+        _stake(alice, 1e18);
+        _fund(DURATION * 1e18 - 3);
+        assertEq(vault.rewardRate(), 1e18);
+        assertEq(vault.unallocatedRewards(), 0);
+        vm.warp(vault.periodFinish());
+        vm.prank(alice);
+        vault.exit();
+        assertEq(vault.totalRewardsPaid(), vault.totalRewardsFunded());
+        assertEq(vault.rewardReserve(), 0);
+        assertEq(vault.unallocatedRewards(), 0);
+        assertEq(token.balanceOf(address(vault)), 10e18, "donation entered reward accounting");
+    }
+
+    function test_dustRecyclingPreservesFormerStakersUnpaidRewards() public {
+        _stake(alice, 3e18);
+        _stake(bob, 4e18);
+        uint256 funding = DURATION * (1e18 + 1);
+        _fund(funding);
+        vm.warp(vault.periodFinish());
+        uint256 aliceOwed = vault.earned(alice);
+        uint256 bobOwed = vault.earned(bob);
+        vm.prank(alice);
+        vault.unstake(3e18); // Alice leaves her entire earned reward unclaimed.
+        assertEq(vault.unallocatedRewards(), 0, "must not reconcile while Bob is still staked");
+        vm.prank(bob);
+        vault.exit();
+        uint256 dust = funding - aliceOwed - bobOwed;
+        assertGt(dust, 0);
+        assertEq(vault.totalCheckpointedRewards(), aliceOwed);
+        assertEq(vault.unallocatedRewards(), dust);
+        assertEq(vault.rewardReserve(), aliceOwed + dust);
+
+        _stake(bob, 1e18);
+        _fund(DURATION * 1e18 - dust);
+        assertEq(vault.unallocatedRewards(), 0);
+        vm.warp(vault.periodFinish());
+        vm.prank(bob);
+        vault.exit();
+        assertEq(vault.rewardReserve(), aliceOwed);
+        assertEq(vault.totalCheckpointedRewards(), aliceOwed);
+        assertEq(vault.unallocatedRewards(), 0);
+        uint256 aliceBalance = token.balanceOf(alice);
+        vm.prank(alice);
+        vault.claim();
+        assertEq(token.balanceOf(alice) - aliceBalance, aliceOwed);
+        assertEq(vault.rewardReserve(), 0);
+        assertEq(vault.totalCheckpointedRewards(), 0);
+        _assertSolvent();
+    }
+
+    function test_midStreamLastWithdrawalReservesFutureStreamAndUnpaidRewards() public {
+        _stake(alice, 7e18);
+        _fund(DURATION * (1e18 + 1));
+        vm.warp(vm.getBlockTimestamp() + LOCK + 1);
+        uint256 aliceOwed = vault.earned(alice);
+        uint256 futureStream = (vault.periodFinish() - vm.getBlockTimestamp()) * vault.rewardRate();
+        uint256 dust = vault.rewardReserve() - aliceOwed - futureStream;
+        vm.prank(alice);
+        vault.unstake(7e18);
+        assertGt(dust, 0);
+        assertEq(vault.unallocatedRewards(), dust);
+        assertEq(vault.totalCheckpointedRewards(), aliceOwed);
+        assertEq(vault.rewardReserve(), aliceOwed + futureStream + dust);
+
+        vm.prank(alice);
+        vault.claim();
+        assertEq(vault.totalCheckpointedRewards(), 0);
+        assertEq(vault.rewardReserve(), futureStream + dust);
+        vm.warp(vault.periodFinish());
+        _stake(bob, 1e18); // Checkpoint the empty remainder of the period.
+        assertEq(vault.unallocatedRewards(), futureStream + dust);
+        assertEq(vault.earned(bob), 0);
+        _assertSolvent();
+    }
+
+    function test_repeatedAccountCheckpointsBecomeRecyclableDustOnExit() public {
+        _stake(alice, 3e18 + 1);
+        _stake(bob, 4e18 + 2);
+        _fund(DURATION * (1e18 + 1));
+        uint256 start = vm.getBlockTimestamp();
+        for (uint256 i = 1; i <= 5; ++i) {
+            vm.warp(start + i * 1 days + 2 * i);
+            vm.prank(alice);
+            vault.claim();
+            assertEq(vault.totalCheckpointedRewards(), 0);
+        }
+        vm.warp(vault.periodFinish());
+        vm.prank(alice);
+        vault.exit();
+        vm.prank(bob);
+        vault.exit();
+        assertEq(vault.totalCheckpointedRewards(), 0);
+        assertGt(vault.rewardReserve(), 3, "test must exercise repeated rounding losses");
+        assertEq(vault.unallocatedRewards(), vault.rewardReserve());
+        _assertSolvent();
+    }
+
     // ------------------------------------------------------------------------------------------------------
     // Principal is untouchable
     // ------------------------------------------------------------------------------------------------------
@@ -556,7 +762,7 @@ contract StakingVaultTest is Test {
         _stake(bob, 250e18);
         _fund(5_000e18);
         vm.warp(vm.getBlockTimestamp() + 12 days);
-        _fund(1_500e18);
+        _fund(2_500e18); // Cover the elapsed stream so restarting cannot lower its rate.
         vm.warp(vm.getBlockTimestamp() + 20 days);
         _stake(bob, 50e18);
         vm.warp(vm.getBlockTimestamp() + 40 days);
